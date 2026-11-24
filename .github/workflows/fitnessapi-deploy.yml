@@ -1,12 +1,12 @@
 name: FitnessAPI CI/CD
 on:
   pull_request:
-    branches: [lr7-dz8]
+    branches: [ci-cd]
     paths:
       - 'БР1.2/Соболев Артём/labs/lab2/FitnessAPI/**'
       - '.github/workflows/fitnessapi-deploy.yml'
   push:
-    branches: [lr7-dz8]
+    branches: [ci-cd]
     paths:
       - 'БР1.2/Соболев Артём/labs/lab2/FitnessAPI/**'
       - '.github/workflows/fitnessapi-deploy.yml'
@@ -44,7 +44,7 @@ jobs:
 
   publish:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/lr7-dz8'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/ci-cd'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
