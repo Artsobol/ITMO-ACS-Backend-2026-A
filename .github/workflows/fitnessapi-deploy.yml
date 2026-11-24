@@ -81,28 +81,27 @@ jobs:
           DEPLOY_USER: ${{ vars.FITNESSAPI_DEPLOY_USER }}
           DEPLOY_KEY: ${{ secrets.FITNESSAPI_DEPLOY_KEY }}
           HOST_KEYS: ${{ secrets.FITNESSAPI_SSH_KNOWN_HOSTS }}
-          SMOKE_URL: ${{ vars.FITNESSAPI_SMOKE_URL }}
         run: |
           [[ "$REGISTRY_ID" =~ ^[a-z0-9]+$ && "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
           test -n "$DEPLOY_HOST"
           test -n "$DEPLOY_USER"
           test -n "$DEPLOY_KEY"
           test -n "$HOST_KEYS"
-          test -n "$SMOKE_URL"
           umask 077
           ssh_dir=$(mktemp -d)
           trap 'rm -rf "$ssh_dir"' EXIT
           printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key"
           printf '%s\n' "$HOST_KEYS" > "$ssh_dir/known_hosts"
-          ssh -i "$ssh_dir/key" -o BatchMode=yes -o IdentitiesOnly=yes \
+          ssh -i "$ssh_dir/key" -o ConnectTimeout=20 -o BatchMode=yes -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ssh_dir/known_hosts" \
             "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REGISTRY_ID" "$GITHUB_SHA" <<'REMOTE'
           set -euo pipefail
-          k=(kubectl --kubeconfig "$HOME/.kube/fitnessapi-cd" -n fitnessapi)
+          k=(k3s kubectl --kubeconfig "$HOME/.kube/fitnessapi-cd" -n fitnessapi-staging)
           services=(user-service media-service training-service blog-service progress-service)
           for service in "${services[@]}"; do
             "${k[@]}" set image "deployment/$service" "$service=cr.yandex/$1/$service:$2"
             "${k[@]}" rollout status "deployment/$service" --timeout=420s
           done
+          "${k[@]}" --request-timeout=15s get --raw '/api/v1/namespaces/fitnessapi-staging/services/fitnessapi-gateway:http/proxy/api/v1/exercises?page=0&size=20'
+          printf '\nStaging API OK\n'
           REMOTE
-          curl -fsS --retry 4 --retry-delay 3 --max-time 15 "$SMOKE_URL" >/dev/null
