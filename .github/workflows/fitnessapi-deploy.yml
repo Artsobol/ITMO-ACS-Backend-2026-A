@@ -1,0 +1,107 @@
+name: FitnessAPI CI/CD
+on:
+  pull_request:
+    branches: [ci-cd]
+    paths:
+      - 'БР1.2/Соболев Артём/labs/lab2/FitnessAPI/**'
+      - '.github/workflows/fitnessapi-deploy.yml'
+  push:
+    branches: [ci-cd]
+    paths:
+      - 'БР1.2/Соболев Артём/labs/lab2/FitnessAPI/**'
+      - '.github/workflows/fitnessapi-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy after publishing (requires an existing K3s deployment)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fitnessapi-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FITNESSAPI_DIR: 'БР1.2/Соболев Артём/labs/lab2/FitnessAPI'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Run Gradle tests
+        run: |
+          cd "$FITNESSAPI_DIR"
+          bash ./gradlew --no-daemon test
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/ci-cd'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [user-service, media-service, training-service, blog-service, progress-service]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and publish
+        env:
+          REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
+          REGISTRY_KEY: ${{ secrets.YC_REGISTRY_PUSH_KEY }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          test -n "$REGISTRY_ID"
+          test -n "$REGISTRY_KEY"
+          cd "$FITNESSAPI_DIR"
+          image="cr.yandex/$REGISTRY_ID/$SERVICE:$GITHUB_SHA"
+          printf '%s' "$REGISTRY_KEY" | docker login cr.yandex --username json_key --password-stdin
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --push --build-arg "SERVICE=$SERVICE" --tag "$image" .
+
+  deploy:
+    needs: publish
+    if: (github.event_name == 'push' && vars.FITNESSAPI_AUTO_DEPLOY == 'true') || (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    runs-on: ubuntu-latest
+    environment: fitnessapi-cloud
+    concurrency:
+      group: fitnessapi-cloud-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Update K3s and wait for rollout
+        env:
+          REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
+          DEPLOY_HOST: ${{ vars.FITNESSAPI_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.FITNESSAPI_DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.FITNESSAPI_DEPLOY_KEY }}
+          HOST_KEYS: ${{ secrets.FITNESSAPI_SSH_KNOWN_HOSTS }}
+        run: |
+          [[ "$REGISTRY_ID" =~ ^[a-z0-9]+$ && "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_KEY"
+          test -n "$HOST_KEYS"
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$HOST_KEYS" > "$ssh_dir/known_hosts"
+          ssh -i "$ssh_dir/key" -o ConnectTimeout=20 -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ssh_dir/known_hosts" \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REGISTRY_ID" "$GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          k=(k3s kubectl --kubeconfig "$HOME/.kube/fitnessapi-cd" -n fitnessapi-staging)
+          services=(user-service media-service training-service blog-service progress-service)
+          for service in "${services[@]}"; do
+            "${k[@]}" set image "deployment/$service" "$service=cr.yandex/$1/$service:$2"
+            "${k[@]}" rollout status "deployment/$service" --timeout=420s
+          done
+          "${k[@]}" --request-timeout=15s get --raw '/api/v1/namespaces/fitnessapi-staging/services/fitnessapi-gateway:http/proxy/api/v1/exercises?page=0&size=20'
+          printf '\nStaging API OK\n'
+          REMOTE
